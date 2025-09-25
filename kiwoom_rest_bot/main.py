@@ -7,8 +7,8 @@ import pandas as pd
 from datetime import datetime, timedelta
 import time
 import sqlite3
-import os
-from manage_data import update_database_and_charts
+from contextlib import asynccontextmanager
+from manage_data import update_database_and_charts  # manage_data.py에서 함수 가져오기
 
 # --- ⚙️ 1. 사용자 설정 ---
 IS_MOCK = True
@@ -30,41 +30,36 @@ bot_state = {"access_token": None}
 
 
 # --- 🔑 3. API 연동 함수 ---
-def _request_api(path: str, headers: dict = None, body: dict = None):
-    """Kiwoom REST API 요청을 위한 범용 래퍼 함수"""
-    URL = f"{BASE_URL}{path}"
-    try:
-        res = requests.post(URL, headers=headers, json=body)
-        time.sleep(1)  # API 요청 후 1초 대기
-        res.raise_for_status()  # HTTP 4xx/5xx 에러 발생 시 예외 발생
-        return res.json()
-    except requests.exceptions.RequestException as e:
-        # 네트워크/HTTP 레벨 에러
-        err_msg = f"Request to {URL} failed: {e}"
-        if "res" in locals():
-            err_msg += f" - Response: {res.text}"
-        raise HTTPException(status_code=500, detail=err_msg)
-
-
 def get_access_token():
     """API 접근 토큰 발급"""
-    PATH = "/oauth2/token"
     body = {
         "grant_type": "client_credentials",
         "appkey": APP_KEY,
         "secretkey": APP_SECRET,
     }
+    PATH = "/oauth2/token"
+    URL = f"{BASE_URL}{PATH}"
+    try:
+        res = requests.post(URL, json=body)
+        res.raise_for_status()
+        response_json = res.json()
 
-    response_json = _request_api(path=PATH, body=body)
+        if response_json.get("return_code") == 0:
+            access_token = response_json.get("token")
+            if access_token:
+                bot_state["access_token"] = access_token
+                print("✅ 토큰 발급 성공")
+                return response_json
 
-    if response_json.get("return_code") == 0:
-        access_token = response_json.get("token")
-        if access_token:
-            bot_state["access_token"] = access_token
-            print("✅ 토큰 발급 성공")
-            return response_json
+        raise HTTPException(
+            status_code=500, detail=f"Token issue failed: {response_json}"
+        )
 
-    raise HTTPException(status_code=500, detail=f"Token issue failed: {response_json}")
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Token request failed: {e} - Response: {res.text if 'res' in locals() else 'No response'}",
+        )
 
 
 def get_balance():
@@ -72,50 +67,88 @@ def get_balance():
     token = bot_state.get("access_token")
     if not token:
         raise HTTPException(status_code=401, detail="토큰이 없습니다.")
-
-    PATH = "/api/dostk/acnt"
     headers = {
         "Content-Type": "application/json;charset=UTF-8",
         "authorization": f"Bearer {token}",
         "api-id": "kt00018",
     }
     body = {"qry_tp": "1", "dmst_stex_tp": "KRX"}
-
-    response_json = _request_api(path=PATH, headers=headers, body=body)
-
-    if response_json and response_json.get("return_code") == 0:
-        # --- 여기부터 데이터 가공 로직 추가 ---
-
-        # 계좌 요약 정보 추출
-        summary = {
-            "cash_balance": int(response_json.get("dps_bal", 0)),
-            "total_purchase": int(response_json.get("tot_puno_amt", 0)),
-            "total_evaluation": int(response_json.get("tot_evlu_amt", 0)),
-            "profit_loss_rate": float(response_json.get("prts_rate", 0.0)),
-        }
-
-        # 보유 종목 정보 추출
-        holdings = []
-        stock_list = response_json.get("stk_list", [])
-        for stock in stock_list:
-            holding_item = {
-                "ticker": stock.get("stk_cd"),
-                "name": stock.get("stk_nm"),
-                "quantity": int(stock.get("hldg_qty", 0)),
-                "average_price": int(stock.get("puno_uv", 0)),
-                "current_price": int(stock.get("cur_pric", 0)),
-                "profit_loss": int(stock.get("evlu_pfls_amt", 0)),
-                "profit_loss_rate": float(stock.get("evlu_pfls_rt", 0.0)),
+    PATH = "/api/dostk/acnt"
+    URL = f"{BASE_URL}{PATH}"
+    try:
+        res = requests.post(URL, headers=headers, json=body)
+        res.raise_for_status()
+        response_json = res.json()
+        if response_json.get("return_code") == 0:
+            summary = {
+                "cash_balance": int(response_json.get("prsm_dpst_aset_amt", 0)),
+                "total_purchase": int(response_json.get("tot_pur_amt", 0)),
+                "total_evaluation": int(response_json.get("tot_evlt_amt", 0)),
+                "profit_loss_rate": float(response_json.get("tot_prft_rt", 0.0)),
             }
-            holdings.append(holding_item)
-
-        # 최종적으로 정리된 데이터 반환
-        return {"account_summary": summary, "holdings": holdings}
-        # ------------------------------------
-    else:
+            holdings = []
+            for stock in response_json.get("acnt_evlt_remn_indv_tot", []):
+                holdings.append(
+                    {
+                        "ticker": stock.get("stk_cd"),
+                        "name": stock.get("stk_nm").strip(),
+                        "quantity": int(stock.get("rmnd_qty", 0)),
+                        "average_price": int(stock.get("pur_pric", 0)),
+                        "current_price": int(stock.get("cur_prc", 0)),
+                        "profit_loss": int(stock.get("evltv_prft", 0)),
+                        "profit_loss_rate": float(stock.get("prft_rt", 0.0)),
+                    }
+                )
+            return {"account_summary": summary, "holdings": holdings}
+        else:
+            raise HTTPException(
+                status_code=500, detail=f"Balance check failed: {response_json}"
+            )
+    except requests.exceptions.RequestException as e:
         raise HTTPException(
-            status_code=500, detail=f"Balance check failed: {response_json}"
+            status_code=500, detail=f"Balance check failed on request: {e}"
         )
+
+
+def get_current_price(ticker: str):
+    """주식 현재가 조회"""
+    token = bot_state.get("access_token")
+    if not token:
+        raise HTTPException(status_code=401, detail="토큰이 없습니다.")
+    headers = {
+        "Content-Type": "application/json;charset=UTF-8",
+        "authorization": f"Bearer {token}",
+        "api-id": "ka10001",
+    }
+    body = {"stk_cd": ticker}
+    PATH = "/api/dostk/stkinfo"
+    URL = f"{BASE_URL}{PATH}"
+    try:
+        res = requests.post(URL, headers=headers, json=body)
+        res.raise_for_status()
+        response_json = res.json()
+        if response_json.get("return_code") == 0:
+            return int(response_json.get("stk_prpr", 0))
+        else:
+            print(f"[{ticker}] 현재가 조회 실패: {response_json}")
+            return 0
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=500, detail=f"Price check failed: {res.text}")
+
+
+def get_daily_chart_from_db(ticker: str):
+    """SQLite DB에서 특정 종목의 일봉 데이터를 조회합니다."""
+    try:
+        conn = sqlite3.connect("stocks.db")
+        df = pd.read_sql_query(
+            f"SELECT * FROM daily_charts WHERE ticker = '{ticker}' ORDER BY date ASC",
+            conn,
+        )
+        conn.close()
+        return df
+    except Exception as e:
+        print(f"[{ticker}] DB에서 일봉 데이터를 읽는 중 오류 발생: {e}")
+        return pd.DataFrame()
 
 
 def place_order(ticker: str, quantity: int, price: int, order_type: str):
@@ -138,136 +171,161 @@ def place_order(ticker: str, quantity: int, price: int, order_type: str):
         "cond_uv": "",
     }
     PATH = "/api/dostk/ordr"
-
-    response_json = _request_api(path=PATH, headers=headers, body=body)
-
-    if response_json.get("return_code") == 0:
-        return response_json
-    else:
-        raise HTTPException(status_code=500, detail=f"Order failed: {response_json}")
+    URL = f"{BASE_URL}{PATH}"
+    try:
+        res = requests.post(URL, headers=headers, json=body)
+        res.raise_for_status()
+        response_json = res.json()
+        if response_json.get("return_code") == 0:
+            return response_json
+        else:
+            raise HTTPException(
+                status_code=500, detail=f"Order failed: {response_json}"
+            )
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=500, detail=f"Order failed on request: {e}")
 
 
 # --- 🤖 4. AI 분석 및 자동화 로직 ---
-def run_ai_analysis(ticker: str, name: str, db_conn: sqlite3.Connection):
-    """이동평균선 골든크로스 전략으로 매매 신호를 생성하는 함수 (DB 데이터 사용)"""
-    print(f"[AI 두뇌] {ticker} ({name}) 종목 분석 중 (DB 데이터)...")
-    try:
-        # DB에서 일봉 데이터를 읽어 DataFrame으로 변환
-        daily_df = pd.read_sql_query(
-            "SELECT date, open, high, low, close, volume FROM daily_charts WHERE ticker = ? ORDER BY date ASC",
-            db_conn,
-            params=(ticker,),
-        )
+def run_ai_analysis(ticker: str, owned_quantity: int = 0):
+    """이동평균선 전략으로 매매 신호를 생성하는 함수"""
+    daily_df = get_daily_chart_from_db(ticker)
+    if daily_df.empty or len(daily_df) < 20:
+        return None
+    daily_df["ma5"] = daily_df["close"].rolling(window=5).mean()
+    daily_df["ma20"] = daily_df["close"].rolling(window=20).mean()
+    daily_df.dropna(inplace=True)
+    if len(daily_df) < 2:
+        return None
+    latest = daily_df.iloc[-1]
+    previous = daily_df.iloc[-2]
 
-        if daily_df.empty or len(daily_df) < 20:
-            return None
+    # 매수 전략: 보유하지 않은 종목의 골든 크로스
+    if (
+        owned_quantity == 0
+        and previous["ma5"] < previous["ma20"]
+        and latest["ma5"] > latest["ma20"]
+    ):
+        # --- 여기를 수정했습니다! ---
+        # 신호에 수량 계산을 위한 '어제 종가'를 포함하여 반환
+        return {"ticker": ticker, "action": "buy", "price_for_calc": latest["close"]}
 
-        daily_df["ma5"] = daily_df["close"].rolling(window=5).mean()
-        daily_df["ma20"] = daily_df["close"].rolling(window=20).mean()
-        daily_df.dropna(inplace=True)
-
-        if len(daily_df) < 2:
-            return None
-
-        latest = daily_df.iloc[-1]
-        previous = daily_df.iloc[-2]
-
-        if previous["ma5"] < previous["ma20"] and latest["ma5"] > latest["ma20"]:
-            print(f"[매수 신호 발생]: {ticker} ({name}) 골든 크로스 감지")
-            return {"ticker": ticker, "quantity": 1, "price": 0, "action": "buy"}
-
-    except Exception as e:
-        print(f"[오류 발생] AI 분석 중 오류: {ticker} ({name}) - {e}")
-
+    # 매도 전략: 보유 중인 종목의 데드 크로스
+    if (
+        owned_quantity > 0
+        and previous["ma5"] > previous["ma20"]
+        and latest["ma5"] < latest["ma20"]
+    ):
+        return {"ticker": ticker, "quantity": owned_quantity, "action": "sell"}
     return None
 
 
 def trading_job():
-    """주기적으로 실행될 자동매매 작업"""
+    """포트폴리오 기반 자동매매 작업"""
     print(f"\n--- [자동매매 작업 시작]: {time.strftime('%Y-%m-%d %H:%M:%S')} ---")
-
-    conn = None  # conn 변수 초기화
     try:
         if not bot_state.get("access_token"):
             print("토큰이 없어 새로 발급합니다.")
             get_access_token()
 
-        # DB 경로 설정 및 연결
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        db_path = os.path.join(script_dir, "stocks.db")
-        conn = sqlite3.connect(db_path)
+        balance_info = get_balance()
+        total_assets = (
+            balance_info["account_summary"]["total_evaluation"]
+            + balance_info["account_summary"]["cash_balance"]
+        )
+        investment_budget = total_assets * 0.5
+        owned_stocks = {stock["ticker"]: stock for stock in balance_info["holdings"]}
 
-        # 종목 코드와 이름을 함께 조회
-        ticker_list = conn.execute("SELECT ticker, name FROM stocks").fetchall()
-        print(f"총 {len(ticker_list)}개의 KOSPI 종목에 대한 분석을 시작합니다.")
+        conn = sqlite3.connect("stocks.db")
+        tickers = conn.execute("SELECT ticker FROM stocks").fetchall()
+        conn.close()
+        ticker_list = [t[0] for t in tickers]
+
+        buy_signals = []
+        sell_signals = []
+
+        print(f"총 {len(ticker_list)}개 종목 분석 시작...")
+        # 매도 신호 분석
+        for ticker, stock_info in owned_stocks.items():
+            signal = run_ai_analysis(ticker, owned_quantity=stock_info["quantity"])
+            if signal and signal["action"] == "sell":
+                sell_signals.append(signal)
+
+        # 매수 신호 분석
+        for ticker in ticker_list:
+            if ticker not in owned_stocks:
+                signal = run_ai_analysis(ticker, owned_quantity=0)
+                if signal and signal["action"] == "buy":
+                    buy_signals.append(signal)
+
+        print("\n--- 주문 실행 단계 ---")
+        # 매도 주문 실행
+        for signal in sell_signals:
+            try:
+                print(
+                    f"SELL Signal: {signal['ticker']}, Quantity: {signal['quantity']}"
+                )
+                place_order(signal["ticker"], signal["quantity"], 0, "sell")
+            except Exception as e:
+                print(f"💥 [주문 오류] {signal['ticker']} 매도 주문 실패: {e}")
+            finally:
+                # 성공하든 실패하든 항상 1초 대기
+                time.sleep(1)
+
+        # 매수 주문 실행
+        if buy_signals:
+            investment_per_stock = investment_budget / len(buy_signals)
+            print(
+                f"총 매수 예산: {investment_budget:.0f}원, 종목당 예산: {investment_per_stock:.0f}원 ({len(buy_signals)}개 종목)"
+            )
+
+            for signal in buy_signals:
+                try:
+                    price_for_calc = signal["price_for_calc"]
+                    if price_for_calc > 0:
+                        quantity = int(investment_per_stock // price_for_calc)
+                        if quantity > 0:
+                            print(
+                                f"BUY Signal: {signal['ticker']}, Quantity: {quantity} (기준가: {price_for_calc})"
+                            )
+                            place_order(signal["ticker"], quantity, 0, "buy")
+                except Exception as e:
+                    print(f"💥 [주문 오류] {signal['ticker']} 매수 주문 실패: {e}")
+                finally:
+                    # 성공하든 실패하든 항상 1초 대기
+                    time.sleep(1)
+        else:
+            print("새로운 매수 신호가 없습니다.")
 
     except Exception as e:
-        print(f"[오류 발생] 작업 준비 중 오류: {e}")
-        if conn:
-            conn.close()
-        print(f"--- [자동매매 작업 종료]: {time.strftime('%Y-%m-%d %H:%M:%S')} ---")
-        return
-
-    # 각 종목을 분석하고 주문하는 루프
-    for ticker, name in ticker_list:
-        try:
-            # DB 커넥션과 종목명을 함께 전달
-            signal = run_ai_analysis(ticker, name, conn)
-            if signal:
-                print(f"주문 실행: {signal}")
-                place_order(
-                    signal["ticker"],
-                    signal["quantity"],
-                    signal["price"],
-                    signal["action"],
-                )
-        except Exception as e:
-            print(f"[오류 발생] {ticker} ({name}) 종목 처리 중 오류: {e}")
-            continue
-
-    if conn:
-        conn.close()
+        print(f"💥 [오류] 자동매매 작업 중 심각한 오류 발생: {e}")
     print(f"--- [자동매매 작업 종료]: {time.strftime('%Y-%m-%d %H:%M:%S')} ---")
 
 
 # --- 🖥️ 5. 웹 API 엔드포인트 및 스케줄러 ---
-from contextlib import asynccontextmanager
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """서버 시작 시 데이터베이스를 최신화하고 스케줄러를 실행합니다."""
     print("--- 서버 시작 프로세스 ---")
-    
-    # 1. 데이터베이스 최신화
     print("데이터베이스 최신화를 시작합니다...")
     try:
         update_database_and_charts()
-        print("데이터베이스 최신화 완료.")
+        print("✅ 데이터베이스 최신화 완료.")
     except Exception as e:
-        print(f"데이터베이스 최신화 중 오류 발생: {e}")
+        print(f"💥 데이터베이스 최신화 중 오류 발생: {e}")
 
-    # 2. 초기 토큰 발급
     print("\n초기 토큰 발급을 시도합니다...")
     try:
         get_access_token()
     except Exception as e:
-        print(f"초기 토큰 발급 실패: {e}")
+        print(f"💥 초기 토큰 발급 실패: {e}")
 
-    # 3. 자동매매 스케줄러 시작
     print("\n자동매매 스케줄러를 시작합니다.")
     scheduler = BackgroundScheduler()
-    scheduler.add_job(
-        trading_job,
-        "cron",
-        hour=9,
-        minute=30,
-    )
+    scheduler.add_job(trading_job, "cron", hour=18, minute=0)
     scheduler.start()
     print("--- 서버 시작 완료 ---")
-
     yield
-    
     print("--- 서버 종료 ---")
 
 
