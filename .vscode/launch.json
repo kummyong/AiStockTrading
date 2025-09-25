@@ -1,0 +1,21 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Python: FastAPI",
+      "type": "python",
+      "request": "launch",
+      "module": "uvicorn",
+      "args": ["main:app", "--reload"],
+      "jinja": true,
+      "cwd": "${workspaceFolder}/kiwoom_rest_bot"
+    },
+    {
+      "name": "Python: setup_database.py",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/kiwoom_rest_bot/setup_database.py",
+      "console": "integratedTerminal"
+    }
+  ]
+}
