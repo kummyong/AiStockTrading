@@ -11,10 +11,10 @@
       "cwd": "${workspaceFolder}/kiwoom_rest_bot"
     },
     {
-      "name": "Python: setup_database.py",
+      "name": "Python: manage_data.py",
       "type": "python",
       "request": "launch",
-      "program": "${workspaceFolder}/kiwoom_rest_bot/setup_database.py",
+      "program": "${workspaceFolder}/kiwoom_rest_bot/manage_data.py",
       "console": "integratedTerminal"
     }
   ]

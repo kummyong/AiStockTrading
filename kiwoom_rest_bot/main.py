@@ -7,6 +7,8 @@ import pandas as pd
 from datetime import datetime, timedelta
 import time
 import sqlite3
+import os
+from manage_data import update_database_and_charts
 
 # --- ⚙️ 1. 사용자 설정 ---
 IS_MOCK = True
@@ -62,9 +64,7 @@ def get_access_token():
             print("✅ 토큰 발급 성공")
             return response_json
 
-    raise HTTPException(
-        status_code=500, detail=f"Token issue failed: {response_json}"
-    )
+    raise HTTPException(status_code=500, detail=f"Token issue failed: {response_json}")
 
 
 def get_balance():
@@ -83,7 +83,7 @@ def get_balance():
 
     response_json = _request_api(path=PATH, headers=headers, body=body)
 
-    if response_json.get("return_code") == 0:
+    if response_json and response_json.get("return_code") == 0:
         # --- 여기부터 데이터 가공 로직 추가 ---
 
         # 계좌 요약 정보 추출
@@ -118,41 +118,6 @@ def get_balance():
         )
 
 
-def get_daily_chart(ticker: str):
-    """주식 일봉 데이터 조회"""
-    token = bot_state.get("access_token")
-    if not token:
-        raise HTTPException(status_code=401, detail="토큰이 없습니다.")
-
-    PATH = "/api/dostk/chart"
-    headers = {
-        "Content-Type": "application/json;charset=UTF-8",
-        "authorization": f"Bearer {token}",
-        "api-id": "ka10081",
-    }
-    base_date = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
-    body = {"stk_cd": ticker, "base_dt": base_date, "upd_stkpc_tp": "1"}
-
-    response_json = _request_api(path=PATH, headers=headers, body=body)
-
-    if response_json.get("return_code") == 0:
-        data = response_json.get("stk_dt_pole_chart_qry", [])
-        if not data:
-            return pd.DataFrame()
-
-        df = pd.DataFrame(data)
-        df = df[["dt", "open_pric", "high_pric", "low_pric", "cur_prc", "trde_qty"]]
-        df.columns = ["date", "open", "high", "low", "close", "volume"]
-        df[["open", "high", "low", "close", "volume"]] = df[
-            ["open", "high", "low", "close", "volume"]
-        ].astype(int)
-        df = df.sort_values(by="date", ascending=True).reset_index(drop=True)
-        return df
-    else:
-        print(f"[{ticker}] 일봉 데이터 수신 실패: {response_json}")
-        return pd.DataFrame()
-
-
 def place_order(ticker: str, quantity: int, price: int, order_type: str):
     """주식 주문 (매수/매도)"""
     token = bot_state.get("access_token")
@@ -179,19 +144,22 @@ def place_order(ticker: str, quantity: int, price: int, order_type: str):
     if response_json.get("return_code") == 0:
         return response_json
     else:
-        raise HTTPException(
-            status_code=500, detail=f"Order failed: {response_json}"
-        )
+        raise HTTPException(status_code=500, detail=f"Order failed: {response_json}")
 
 
 # --- 🤖 4. AI 분석 및 자동화 로직 ---
-def run_ai_analysis(ticker: str):
-    """이동평균선 골든크로스 전략으로 매매 신호를 생성하는 함수"""
-    print(f"[AI 두뇌] '{ticker}' 종목 분석 중...")
+def run_ai_analysis(ticker: str, name: str, db_conn: sqlite3.Connection):
+    """이동평균선 골든크로스 전략으로 매매 신호를 생성하는 함수 (DB 데이터 사용)"""
+    print(f"[AI 두뇌] {ticker} ({name}) 종목 분석 중 (DB 데이터)...")
     try:
-        daily_df = get_daily_chart(ticker)
+        # DB에서 일봉 데이터를 읽어 DataFrame으로 변환
+        daily_df = pd.read_sql_query(
+            "SELECT date, open, high, low, close, volume FROM daily_charts WHERE ticker = ? ORDER BY date ASC",
+            db_conn,
+            params=(ticker,),
+        )
+
         if daily_df.empty or len(daily_df) < 20:
-            # print(f"[{ticker}] 데이터가 없거나 부족하여 분석을 건너뜁니다.") # 로그가 너무 길어지므로 주석 처리
             return None
 
         daily_df["ma5"] = daily_df["close"].rolling(window=5).mean()
@@ -205,11 +173,11 @@ def run_ai_analysis(ticker: str):
         previous = daily_df.iloc[-2]
 
         if previous["ma5"] < previous["ma20"] and latest["ma5"] > latest["ma20"]:
-            print(f"[매수 신호 발생]: {ticker} 골든 크로스 감지")
+            print(f"[매수 신호 발생]: {ticker} ({name}) 골든 크로스 감지")
             return {"ticker": ticker, "quantity": 1, "price": 0, "action": "buy"}
 
     except Exception as e:
-        print(f"[오류 발생] AI 분석 중 오류: {ticker} - {e}")
+        print(f"[오류 발생] AI 분석 중 오류: {ticker} ({name}) - {e}")
 
     return None
 
@@ -218,28 +186,33 @@ def trading_job():
     """주기적으로 실행될 자동매매 작업"""
     print(f"\n--- [자동매매 작업 시작]: {time.strftime('%Y-%m-%d %H:%M:%S')} ---")
 
-    # DB 접속 등 준비 과정은 try...except로 묶어 조기에 종료될 수 있도록 함
+    conn = None  # conn 변수 초기화
     try:
         if not bot_state.get("access_token"):
             print("토큰이 없어 새로 발급합니다.")
             get_access_token()
 
-        conn = sqlite3.connect("stocks.db")
-        tickers = conn.execute("SELECT ticker FROM stocks").fetchall()
-        conn.close()
+        # DB 경로 설정 및 연결
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        db_path = os.path.join(script_dir, "stocks.db")
+        conn = sqlite3.connect(db_path)
 
-        ticker_list = [t[0] for t in tickers]
+        # 종목 코드와 이름을 함께 조회
+        ticker_list = conn.execute("SELECT ticker, name FROM stocks").fetchall()
         print(f"총 {len(ticker_list)}개의 KOSPI 종목에 대한 분석을 시작합니다.")
 
     except Exception as e:
         print(f"[오류 발생] 작업 준비 중 오류: {e}")
+        if conn:
+            conn.close()
         print(f"--- [자동매매 작업 종료]: {time.strftime('%Y-%m-%d %H:%M:%S')} ---")
-        return  # 준비 단계에서 오류 시 작업 전체 종료
+        return
 
     # 각 종목을 분석하고 주문하는 루프
-    for ticker in ticker_list:
+    for ticker, name in ticker_list:
         try:
-            signal = run_ai_analysis(ticker)
+            # DB 커넥션과 종목명을 함께 전달
+            signal = run_ai_analysis(ticker, name, conn)
             if signal:
                 print(f"주문 실행: {signal}")
                 place_order(
@@ -248,14 +221,12 @@ def trading_job():
                     signal["price"],
                     signal["action"],
                 )
-
-            # API 호출 한도 준수는 _request_api 함수에서 처리됩니다.
-
         except Exception as e:
-            # 개별 종목 오류는 기록만 하고 건너뜀
-            print(f"[오류 발생] '{ticker}' 종목 처리 중 오류: {e}")
-            continue  # 다음 종목으로 넘어감
+            print(f"[오류 발생] {ticker} ({name}) 종목 처리 중 오류: {e}")
+            continue
 
+    if conn:
+        conn.close()
     print(f"--- [자동매매 작업 종료]: {time.strftime('%Y-%m-%d %H:%M:%S')} ---")
 
 
@@ -265,13 +236,26 @@ from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """서버 시작 시 토큰을 발급하고 스케줄러를 실행합니다."""
-    print("서버 시작... 초기 토큰 발급 및 스케줄러를 시작합니다.")
+    """서버 시작 시 데이터베이스를 최신화하고 스케줄러를 실행합니다."""
+    print("--- 서버 시작 프로세스 ---")
+    
+    # 1. 데이터베이스 최신화
+    print("데이터베이스 최신화를 시작합니다...")
+    try:
+        update_database_and_charts()
+        print("데이터베이스 최신화 완료.")
+    except Exception as e:
+        print(f"데이터베이스 최신화 중 오류 발생: {e}")
+
+    # 2. 초기 토큰 발급
+    print("\n초기 토큰 발급을 시도합니다...")
     try:
         get_access_token()
     except Exception as e:
         print(f"초기 토큰 발급 실패: {e}")
 
+    # 3. 자동매매 스케줄러 시작
+    print("\n자동매매 스케줄러를 시작합니다.")
     scheduler = BackgroundScheduler()
     scheduler.add_job(
         trading_job,
@@ -280,9 +264,11 @@ async def lifespan(app: FastAPI):
         minute=30,
     )
     scheduler.start()
+    print("--- 서버 시작 완료 ---")
 
     yield
-    print("서버 종료...")
+    
+    print("--- 서버 종료 ---")
 
 
 app = FastAPI(lifespan=lifespan)
