@@ -23,6 +23,17 @@
       "request": "launch",
       "program": "${workspaceFolder}/kiwoom_rest_bot/magic_formula_analyzer.py",
       "console": "integratedTerminal"
+    },
+    {
+      "name": "Python: Streamlit (backtest_app.py)",
+      "type": "python",
+      "request": "launch",
+      "module": "streamlit",
+      "args": [
+        "run",
+        "${workspaceFolder}/kiwoom_rest_bot/backtest_app.py"
+      ],
+      "console": "integratedTerminal"
     }
   ]
 }

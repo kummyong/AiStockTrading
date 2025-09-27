@@ -8,22 +8,62 @@ from datetime import datetime, timedelta
 import time
 import sqlite3
 from contextlib import asynccontextmanager
+import os
+import configparser
 
-# from manage_data import update_database_and_charts  # manage_data.py에서 함수 가져오기
+# 📂 마법 공식 전략 함수를 strategy.py에서 가져옵니다.
+from magic_formula_analyzer import analyze_magic_formula
 
-# --- ⚙️ 1. 사용자 설정 ---
-IS_MOCK = True
-APP_KEY = "IWxXc-OxrNyAt3jBCkERK4EV7xbW6DYYHXqK3n0x57A"
-APP_SECRET = "FBAOtvQj0MJBHOmx3s8UBIdH0XK399iHIudXbO2H2Vo"
-ACCOUNT_NO = "81118476"
+
+# --- ⚙️ 1. 설정 관리 ---
+class ConfigManager:
+    """config.ini 파일에서 설정을 읽어 관리합니다."""
+
+    def __init__(self, config_file="config.ini"):
+        if not os.path.isabs(config_file):
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            config_file = os.path.join(script_dir, config_file)
+
+        if not os.path.exists(config_file):
+            raise FileNotFoundError(f"설정 파일({config_file})을 찾을 수 없습니다.")
+
+        config = configparser.ConfigParser()
+        config.read(config_file, encoding="utf-8")
+
+        try:
+            self.is_mock = config.getboolean("SETTINGS", "is_mock")
+            self.portfolio_stock_count = config.getint(
+                "SETTINGS", "portfolio_stock_count", fallback=20
+            )
+        except (configparser.NoSectionError, configparser.NoOptionError):
+            print("⚠️ 'is_mock' 설정을 찾을 수 없어 기본값(True)을 사용합니다.")
+            self.is_mock = True
+            self.portfolio_stock_count = 20
+
+        section = "KIWOOM_MOCK" if self.is_mock else "KIWOOM_REAL"
+
+        try:
+            self.base_url = config.get(section, "base_url").strip("'\"")
+            self.app_key = config.get(section, "app_key").strip("'\"")
+            self.app_secret = config.get(section, "app_secret").strip("'\"")
+            self.account_no = config.get(section, "account_no").strip("'\"")
+            print(
+                f"✅ 설정 로드 완료. 모드: {'모의투자' if self.is_mock else '실서버'}"
+            )
+        except (configparser.NoSectionError, configparser.NoOptionError) as e:
+            raise ValueError(f"'{section}' 섹션에서 설정을 읽는 데 실패했습니다: {e}")
+
+
+config = ConfigManager()
 # --------------------
 
 
 # --- 🌐 2. 서버 및 상태 관리 ---
-if IS_MOCK:
-    BASE_URL = "https://mockapi.kiwoom.com"
-else:
-    BASE_URL = "https://api.kiwoom.com"
+BASE_URL = config.base_url
+APP_KEY = config.app_key
+APP_SECRET = config.app_secret
+ACCOUNT_NO = config.account_no
+PORTFOLIO_STOCK_COUNT = config.portfolio_stock_count
 
 app = FastAPI()
 bot_state = {"access_token": None}
@@ -64,7 +104,7 @@ def get_access_token():
 
 
 def get_balance():
-    """정리된 형태의 계좌 잔고 정보를 조회합니다."""
+    """(수정) 변수명을 명확히 하고, 실제 현금과 총자산을 구분하여 반환합니다."""
     token = bot_state.get("access_token")
     if not token:
         raise HTTPException(status_code=401, detail="토큰이 없습니다.")
@@ -82,16 +122,22 @@ def get_balance():
         response_json = res.json()
         if response_json.get("return_code") == 0:
             summary = {
-                "cash_balance": int(response_json.get("prsm_dpst_aset_amt", 0)),
+                # API의 '추정예탁자산금액'은 실제 총 자산을 의미하므로 변수명 변경
+                "estimated_total_assets": int(
+                    response_json.get("prsm_dpst_aset_amt", 0)
+                ),
+                # API의 '예수금총금액'이 실제 현금을 의미 (dnca_tot_amt는 D+2 예수금을 의미하기도 함)
+                "real_cash_balance": int(response_json.get("dnca_tot_amt", 0)),
                 "total_purchase": int(response_json.get("tot_pur_amt", 0)),
                 "total_evaluation": int(response_json.get("tot_evlt_amt", 0)),
                 "profit_loss_rate": float(response_json.get("tot_prft_rt", 0.0)),
             }
             holdings = []
             for stock in response_json.get("acnt_evlt_remn_indv_tot", []):
+                ticker = stock.get("stk_cd", "")
                 holdings.append(
                     {
-                        "ticker": stock.get("stk_cd"),
+                        "ticker": ticker.lstrip("A") if ticker else "",
                         "name": stock.get("stk_nm").strip(),
                         "quantity": int(stock.get("rmnd_qty", 0)),
                         "average_price": int(stock.get("pur_pric", 0)),
@@ -187,144 +233,112 @@ def place_order(ticker: str, quantity: int, price: int, order_type: str):
         raise HTTPException(status_code=500, detail=f"Order failed on request: {e}")
 
 
-# --- 🤖 4. AI 분석 및 자동화 로직 ---
-def run_ai_analysis(ticker: str, owned_quantity: int = 0):
-    """이동평균선 전략으로 매매 신호를 생성하는 함수"""
-    daily_df = get_daily_chart_from_db(ticker)
-    if daily_df.empty or len(daily_df) < 20:
-        return None
-    daily_df["ma5"] = daily_df["close"].rolling(window=5).mean()
-    daily_df["ma20"] = daily_df["close"].rolling(window=20).mean()
-    daily_df.dropna(inplace=True)
-    if len(daily_df) < 2:
-        return None
-    latest = daily_df.iloc[-1]
-    previous = daily_df.iloc[-2]
-
-    # 매수 전략: 보유하지 않은 종목의 골든 크로스
-    if (
-        owned_quantity == 0
-        and previous["ma5"] < previous["ma20"]
-        and latest["ma5"] > latest["ma20"]
-    ):
-        # --- 여기를 수정했습니다! ---
-        # 신호에 수량 계산을 위한 '어제 종가'를 포함하여 반환
-        return {"ticker": ticker, "action": "buy", "price_for_calc": latest["close"]}
-
-    # 매도 전략: 보유 중인 종목의 데드 크로스
-    if (
-        owned_quantity > 0
-        and previous["ma5"] > previous["ma20"]
-        and latest["ma5"] < latest["ma20"]
-    ):
-        return {"ticker": ticker, "quantity": owned_quantity, "action": "sell"}
-    return None
-
-
-def trading_job():
-    """포트폴리오 기반 자동매매 작업"""
-    print(f"\n--- [자동매매 작업 시작]: {time.strftime('%Y-%m-%d %H:%M:%S')} ---")
+# --- 🤖 4. 마법 공식 자동매매 로직 ---
+def magic_formula_rebalance_job():
+    """(수정) 올바른 총 자산 금액을 사용하여 리밸런싱을 수행합니다."""
+    print(
+        f"\n--- [마법 공식 리밸런싱 시작]: {time.strftime('%Y-%m-%d %H:%M:%S')} ---"
+    )
     try:
         if not bot_state.get("access_token"):
-            print("토큰이 없어 새로 발급합니다.")
             get_access_token()
 
-        balance_info = get_balance()
-        total_assets = (
-            balance_info["account_summary"]["total_evaluation"]
-            + balance_info["account_summary"]["cash_balance"]
+        target_tickers = set(analyze_magic_formula(top_n=PORTFOLIO_STOCK_COUNT))
+        if not target_tickers:
+            print("❌ 목표 포트폴리오 선정 실패. 리밸런싱을 종료합니다.")
+            return
+        print(
+            f"🎯 목표 포트폴리오 ({len(target_tickers)}개): {', '.join(sorted(list(target_tickers)))}"
         )
-        investment_budget = total_assets * 0.5
+
+        balance_info = get_balance()
         owned_stocks = {stock["ticker"]: stock for stock in balance_info["holdings"]}
+        owned_tickers = set(owned_stocks.keys())
+        print(
+            f"현재 보유 종목 ({len(owned_tickers)}개): {', '.join(sorted(list(owned_tickers))) if owned_tickers else '없음'}"
+        )
 
-        conn = sqlite3.connect("stocks.db")
-        tickers = conn.execute("SELECT ticker FROM stocks").fetchall()
-        conn.close()
-        ticker_list = [t[0] for t in tickers]
-
-        buy_signals = []
-        sell_signals = []
-
-        print(f"총 {len(ticker_list)}개 종목 분석 시작...")
-        # 매도 신호 분석
-        for ticker, stock_info in owned_stocks.items():
-            signal = run_ai_analysis(ticker, owned_quantity=stock_info["quantity"])
-            if signal and signal["action"] == "sell":
-                sell_signals.append(signal)
-
-        # 매수 신호 분석
-        for ticker in ticker_list:
-            if ticker not in owned_stocks:
-                signal = run_ai_analysis(ticker, owned_quantity=0)
-                if signal and signal["action"] == "buy":
-                    buy_signals.append(signal)
-
-        print("\n--- 주문 실행 단계 ---")
-        # 매도 주문 실행
-        for signal in sell_signals:
-            try:
-                print(
-                    f"SELL Signal: {signal['ticker']}, Quantity: {signal['quantity']}"
-                )
-                place_order(signal["ticker"], signal["quantity"], 0, "sell")
-            except Exception as e:
-                print(f"💥 [주문 오류] {signal['ticker']} 매도 주문 실패: {e}")
-            finally:
-                # 성공하든 실패하든 항상 1초 대기
-                time.sleep(1)
-
-        # 매수 주문 실행
-        if buy_signals:
-            investment_per_stock = investment_budget / len(buy_signals)
-            print(
-                f"총 매수 예산: {investment_budget:.0f}원, 종목당 예산: {investment_per_stock:.0f}원 ({len(buy_signals)}개 종목)"
-            )
-
-            for signal in buy_signals:
+        tickers_to_sell = owned_tickers - target_tickers
+        if tickers_to_sell:
+            print(f"\n--- 📉 매도 실행 ({len(tickers_to_sell)}개) ---")
+            for ticker in tickers_to_sell:
                 try:
-                    price_for_calc = signal["price_for_calc"]
-                    if price_for_calc > 0:
-                        quantity = int(investment_per_stock // price_for_calc)
-                        if quantity > 0:
-                            print(
-                                f"BUY Signal: {signal['ticker']}, Quantity: {quantity} (기준가: {price_for_calc})"
-                            )
-                            place_order(signal["ticker"], quantity, 0, "buy")
+                    stock_info = owned_stocks[ticker]
+                    quantity_to_sell = stock_info["quantity"]
+                    print(
+                        f"   - 매도 주문: {stock_info['name']}({ticker}), 수량: {quantity_to_sell}"
+                    )
+                    place_order(ticker, quantity_to_sell, 0, "sell")
                 except Exception as e:
-                    print(f"💥 [주문 오류] {signal['ticker']} 매수 주문 실패: {e}")
+                    print(f"   💥 [주문 오류] {ticker} 매도 실패: {e}")
                 finally:
-                    # 성공하든 실패하든 항상 1초 대기
                     time.sleep(1)
         else:
-            print("새로운 매수 신호가 없습니다.")
+            print("\n- 매도할 종목이 없습니다.")
+
+        tickers_to_buy = target_tickers - owned_tickers
+        if tickers_to_buy:
+            print(f"\n--- 📈 매수 실행 ({len(tickers_to_buy)}개) ---")
+            if tickers_to_sell:
+                print("   - 매도 주문 처리를 위해 10초 대기...")
+                time.sleep(10)
+
+            # ▼▼▼ 여기가 수정된 부분입니다 ▼▼▼
+            current_balance = get_balance()
+            # 'estimated_total_assets'를 총 자산으로 사용 (이중 계산 방지)
+            total_assets = current_balance["account_summary"]["estimated_total_assets"]
+            # ▲▲▲ 여기가 수정된 부분입니다 ▲▲▲
+
+            investment_per_stock = total_assets / PORTFOLIO_STOCK_COUNT
+
+            print(
+                f"   - 총 자산: {total_assets:,.0f}원 / 종목당 투자 예산: {investment_per_stock:,.0f}원"
+            )
+
+            for ticker in tickers_to_buy:
+                try:
+                    current_price = get_current_price(ticker)
+                    if current_price > 0:
+                        quantity_to_buy = int(investment_per_stock // current_price)
+                        if quantity_to_buy > 0:
+                            print(
+                                f"   - 매수 주문: {ticker}, 수량: {quantity_to_buy} (현재가: {current_price:,.0f})"
+                            )
+                            place_order(ticker, quantity_to_buy, 0, "buy")
+                        else:
+                            print(
+                                f"   - [{ticker}] 예산 부족으로 매수 불가 (계산된 수량: 0)"
+                            )
+                    else:
+                        print(f"   - [{ticker}] 현재가 조회 실패로 매수 불가")
+                except Exception as e:
+                    print(f"   💥 [주문 오류] {ticker} 매수 실패: {e}")
+                finally:
+                    time.sleep(1)
+        else:
+            print("\n- 신규 매수할 종목이 없습니다.")
 
     except Exception as e:
-        print(f"💥 [오류] 자동매매 작업 중 심각한 오류 발생: {e}")
-    print(f"--- [자동매매 작업 종료]: {time.strftime('%Y-%m-%d %H:%M:%S')} ---")
+        print(f"💥 [오류] 리밸런싱 작업 중 심각한 오류 발생: {e}")
+    finally:
+        print(
+            f"--- [마법 공식 리밸런싱 종료]: {time.strftime('%Y-%m-%d %H:%M:%S')} ---"
+        )
 
 
 # --- 🖥️ 5. 웹 API 엔드포인트 및 스케줄러 ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """서버 시작 시 데이터베이스를 최신화하고 스케줄러를 실행합니다."""
     print("--- 서버 시작 프로세스 ---")
-    print("데이터베이스 최신화를 시작합니다...")
-    # try:
-    #     update_database_and_charts()
-    #     print("✅ 데이터베이스 최신화 완료.")
-    # except Exception as e:
-    #     print(f"💥 데이터베이스 최신화 중 오류 발생: {e}")
-
-    print("\n초기 토큰 발급을 시도합니다...")
     try:
         get_access_token()
     except Exception as e:
         print(f"💥 초기 토큰 발급 실패: {e}")
 
-    print("\n자동매매 스케줄러를 시작합니다.")
     scheduler = BackgroundScheduler()
-    scheduler.add_job(trading_job, "cron", hour=18, minute=0)
+    scheduler.add_job(magic_formula_rebalance_job, "cron", hour=18, minute=0)
     scheduler.start()
+    print("✅ 자동매매 스케줄러 시작 (매일 18:00 실행)")
     print("--- 서버 시작 완료 ---")
     yield
     print("--- 서버 종료 ---")
@@ -359,7 +373,8 @@ def execute_order(ticker: str, quantity: int, price: int, action: str):
     return place_order(ticker, quantity, price, action)
 
 
-@app.post("/run-ai-trade", summary="AI 분석 및 자동매매 1회 실행 (수동)")
-def run_ai_trade():
-    trading_job()
-    return {"message": "AI trading job has been manually triggered."}
+@app.post("/run-rebalance", summary="마법 공식 리밸런싱 1회 실행 (수동)")
+def run_rebalance_manually():
+    """수동으로 리밸런싱 작업을 즉시 실행합니다."""
+    magic_formula_rebalance_job()
+    return {"message": "마법 공식 리밸런싱 작업이 수동으로 실행되었습니다."}

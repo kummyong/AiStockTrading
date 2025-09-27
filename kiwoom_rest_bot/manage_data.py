@@ -10,7 +10,7 @@ import configparser
 import logging
 from tqdm import tqdm
 
-# --- 1. 로깅 설정 ---
+# --- 1. 로깅 설정 (기존과 동일) ---
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -21,7 +21,7 @@ logging.basicConfig(
 )
 
 
-# --- 2. 설정 로드 클래스 (실서버 전용) ---
+# --- 2. 설정 로드 클래스 (기존과 동일) ---
 class ConfigManager:
     """config.ini 파일에서 실서버용 설정을 읽어 관리합니다."""
 
@@ -29,13 +29,10 @@ class ConfigManager:
         if not os.path.isabs(config_file):
             script_dir = os.path.dirname(os.path.abspath(__file__))
             config_file = os.path.join(script_dir, config_file)
-
         config = configparser.ConfigParser()
         if not os.path.exists(config_file):
             raise FileNotFoundError(f"설정 파일({config_file})을 찾을 수 없습니다.")
         config.read(config_file, encoding="utf-8")
-
-        # [KIWOOM_REAL] 섹션의 설정 값을 직접 로드
         self.base_url = config.get("KIWOOM_REAL", "base_url").strip("'\"")
         self.kiwoom_app_key = config.get("KIWOOM_REAL", "app_key").strip("'\"")
         self.kiwoom_app_secret = config.get("KIWOOM_REAL", "app_secret").strip("'\"")
@@ -44,9 +41,8 @@ class ConfigManager:
         logging.info("✅ 실서버용 설정을 성공적으로 불러왔습니다.")
 
 
-# --- 3. DART API 관리 클래스 (이전과 동일) ---
+# --- 3. DART API 관리 클래스 (🚨 수정됨) ---
 class DartManager:
-    # (이전 답변의 DartManager 클래스 코드와 동일)
     """DART API 관련 기능을 관리합니다."""
 
     def __init__(self, api_key, script_dir):
@@ -55,7 +51,6 @@ class DartManager:
         self.corp_codes = self._load_corp_codes()
 
     def _load_corp_codes(self):
-        """DART 고유번호 XML 파일을 로드하거나 다운로드합니다."""
         file_path = os.path.join(self.script_dir, "CORPCODE.xml")
         if not os.path.exists(file_path):
             logging.info(
@@ -66,30 +61,12 @@ class DartManager:
                 params = {"crtfc_key": self.api_key}
                 res = requests.get(url, params=params)
                 res.raise_for_status()
-
-                # 응답이 zip 파일인지 확인
-                content_type = res.headers.get("Content-Type", "")
-                is_zip = (
-                    "application/zip" in content_type
-                    or "application/x-msdownload" in content_type
-                )
-                if not is_zip:
-                    logging.error(
-                        f"❌ DART API에서 zip 파일을 반환하지 않았습니다. API 키가 유효한지 확인해주세요."
-                    )
-                    logging.error(
-                        f"응답 내용: {res.text[:200]}"
-                    )  # 응답 내용 일부를 로깅
-                    return {}
-
                 with zipfile.ZipFile(io.BytesIO(res.content)) as zfile:
                     zfile.extractall(self.script_dir)
                 logging.info("✅ 'CORPCODE.xml' 파일 다운로드 및 압축 해제 성공!")
             except Exception as e:
                 logging.error(f"❌ 'CORPCODE.xml' 파일 다운로드 실패: {e}")
                 return {}
-
-        logging.info("DART 고유번호 파일(CORPCODE.xml)을 로드합니다...")
         try:
             with open(file_path, "rb") as f:
                 root = ET.parse(f).getroot()
@@ -108,16 +85,10 @@ class DartManager:
             logging.error(f"❌ DART 고유번호 파일 로드 중 오류 발생: {e}")
             return {}
 
-    def get_dart_code(self, ticker: str):
-        return self.corp_codes.get(ticker)
-
     def get_financial_info(self, ticker: str):
-        """DART API를 통해 최신 재무 정보를 가져옵니다."""
-        dart_code = self.get_dart_code(ticker)
+        """DART API를 통해 EV/EBITDA 계산에 필요한 상세 재무 정보를 가져옵니다."""
+        dart_code = self.corp_codes.get(ticker)
         if not dart_code:
-            logging.debug(
-                f"재무(DART): [{ticker}] DART 고유번호 없음 (ETF 등으로 추정)"
-            )
             return None
 
         current_year = datetime.now().year
@@ -142,19 +113,32 @@ class DartManager:
                     if data.get("status") != "000":
                         continue
 
-                net_income, total_equity = None, None
-                for item in data.get("list", []):
-                    account_name = item.get("account_nm", "")
-                    if "당기순이익" in account_name:
-                        amount_str = item.get("thstrm_amount", "0").replace(",", "")
-                        net_income = int(amount_str) if amount_str else 0
-                    if account_name == "자본총계":
-                        amount_str = item.get("thstrm_amount", "0").replace(",", "")
-                        total_equity = int(amount_str) if amount_str else 0
+                # 필요한 계정 과목들을 저장할 딕셔너리
+                accounts = {}
 
-                if net_income is not None and total_equity not in [None, 0]:
-                    roe = (net_income / total_equity) * 100
-                    return {"roe": roe, "business_year": year}
+                # 검색할 계정 과목 목록
+                # 참고: 기업마다 계정과목명이 조금씩 다를 수 있어 'in' 연산자로 일부만 일치해도 찾도록 함
+                account_map = {
+                    "당기순이익": "net_income",
+                    "자본총계": "total_equity",
+                    "영업이익": "operating_income",
+                    "유형자산상각비": "depreciation",
+                    "무형자산상각비": "amortization",
+                    "부채총계": "total_debt",
+                    "현금및현금성자산": "cash_and_equivalents",
+                }
+
+                for item in data.get("list", []):
+                    account_nm = item.get("account_nm", "").strip()
+                    for key, value in account_map.items():
+                        if key in account_nm:
+                            amount_str = item.get("thstrm_amount", "0").replace(",", "")
+                            accounts[value] = int(amount_str) if amount_str else 0
+
+                # 필수 정보가 모두 수집되었다면 결과 반환
+                if "net_income" in accounts and "total_equity" in accounts:
+                    accounts["business_year"] = year
+                    return accounts
 
             except Exception as e:
                 logging.warning(
@@ -164,9 +148,8 @@ class DartManager:
         return None
 
 
-# --- 4. 키움 API 관리 클래스 (이전과 동일) ---
+# --- 4. 키움 API 관리 클래스 (🚨 수정됨) ---
 class KiwoomApiManager:
-    # (이전 답변의 KiwoomApiManager 클래스 코드와 동일)
     """키움증권 API 요청을 관리합니다."""
 
     def __init__(self, config):
@@ -183,7 +166,7 @@ class KiwoomApiManager:
                 "secretkey": self.config.kiwoom_app_secret,
             },
         )
-        if res_json and "token" in res_json:
+        if res_json and res_json.get("return_code") == 0 and "token" in res_json:
             logging.info("✅ 토큰 발급 성공")
             return res_json["token"]
         logging.error(f"❌ 토큰 발급 실패: {res_json}")
@@ -205,7 +188,7 @@ class KiwoomApiManager:
         return res_json.get("list", []) if res_json else []
 
     def get_financial_info(self, ticker: str):
-        """키움증권 API를 통해 PER, PBR 등의 재무 정보를 가져옵니다."""
+        """키움증권 API를 통해 PER, PBR, BPS, 시가총액(mac) 등의 재무 정보를 가져옵니다."""
         if not self.access_token:
             return None
         headers = {
@@ -218,13 +201,14 @@ class KiwoomApiManager:
         res_json = self._request_api(
             path="/api/dostk/stkinfo", headers=headers, body=body
         )
-
         if res_json and res_json.get("per"):
             try:
                 return {
                     "per": float(res_json.get("per", 0)),
                     "pbr": float(res_json.get("pbr", 0)),
                     "bps": int(res_json.get("bps", 0)),
+                    "mac": int(res_json.get("mac", 0))
+                    * 100000000,  # 억원 단위이므로 원 단위로 변환
                 }
             except (ValueError, TypeError):
                 logging.warning(f"재무(키움): [{ticker}] 데이터 변환 중 오류 발생")
@@ -234,9 +218,9 @@ class KiwoomApiManager:
     def _request_api(self, path, headers=None, body=None, params=None):
         url = f"{self.config.base_url}{path}"
         try:
-            if body:  # POST 요청
+            if body:
                 res = requests.post(url, headers=headers, json=body, timeout=10)
-            else:  # GET 요청
+            else:
                 res = requests.get(url, headers=headers, params=params, timeout=10)
             time.sleep(1)
             res.raise_for_status()
@@ -246,9 +230,8 @@ class KiwoomApiManager:
             return None
 
 
-# --- 5. 데이터베이스 관리 클래스 (이전과 동일) ---
+# --- 5. 데이터베이스 관리 클래스 (기존과 동일) ---
 class DatabaseManager:
-    # (이전 답변의 DatabaseManager 클래스 코드와 동일)
     """SQLite 데이터베이스 작업을 관리합니다."""
 
     def __init__(self, db_path):
@@ -264,7 +247,10 @@ class DatabaseManager:
             """
             CREATE TABLE IF NOT EXISTS financial_info (
                 ticker TEXT PRIMARY KEY, business_year INTEGER,
-                per REAL, pbr REAL, roe REAL, ev_ebitda REAL, bps INTEGER
+                per REAL, pbr REAL, roe REAL, ev_ebitda REAL, bps INTEGER,
+                mac INTEGER, net_income INTEGER, total_equity INTEGER,
+                operating_income INTEGER, depreciation INTEGER, amortization INTEGER,
+                total_debt INTEGER, cash_and_equivalents INTEGER
             )"""
         )
         self.conn.commit()
@@ -288,8 +274,17 @@ class DatabaseManager:
 
     def update_financial_info(self, data):
         self.cursor.execute(
-            """INSERT OR REPLACE INTO financial_info (ticker, business_year, per, pbr, roe, ev_ebitda, bps)
-               VALUES (:ticker, :business_year, :per, :pbr, :roe, :ev_ebitda, :bps)""",
+            """
+            INSERT OR REPLACE INTO financial_info (
+                ticker, business_year, per, pbr, roe, ev_ebitda, bps,
+                mac, net_income, total_equity, operating_income, depreciation,
+                amortization, total_debt, cash_and_equivalents
+            )
+            VALUES (
+                :ticker, :business_year, :per, :pbr, :roe, :ev_ebitda, :bps,
+                :mac, :net_income, :total_equity, :operating_income, :depreciation,
+                :amortization, :total_debt, :cash_and_equivalents
+            )""",
             data,
         )
 
@@ -300,13 +295,48 @@ class DatabaseManager:
         self.conn.close()
 
 
-# --- 6. 메인 실행 로직 ---
+# --- [신규] 계산 로직 함수 ---
+def calculate_ev_ebitda(kiwoom_info, dart_info):
+    """키움과 DART에서 수집한 정보를 바탕으로 EV/EBITDA를 계산합니다."""
+    if not kiwoom_info or not dart_info:
+        return None
+
+    try:
+        # EV 계산
+        market_cap = kiwoom_info.get("mac")
+        total_debt = dart_info.get("total_debt")
+        cash = dart_info.get("cash_and_equivalents")
+
+        if market_cap is None or total_debt is None or cash is None:
+            return None
+        ev = market_cap + total_debt - cash
+
+        # EBITDA 계산
+        operating_income = dart_info.get("operating_income")
+        depreciation = dart_info.get("depreciation", 0)  # 없으면 0으로 처리
+        amortization = dart_info.get("amortization", 0)  # 없으면 0으로 처리
+
+        if operating_income is None:
+            return None
+        ebitda = operating_income + depreciation + amortization
+
+        # EV/EBITDA 계산
+        if ev > 0 and ebitda > 0:
+            return ev / ebitda
+
+    except Exception as e:
+        logging.warning(f"EV/EBITDA 계산 중 오류 발생: {e}")
+
+    return None
+
+
+# --- 6. 메인 실행 로직 (🚨 수정됨) ---
 def main():
     """메인 실행 함수"""
+    db_manager = None
     try:
         script_dir = os.path.dirname(os.path.abspath(__file__))
         config = ConfigManager()
-
         db_path = os.path.join(script_dir, "stocks.db")
         db_manager = DatabaseManager(db_path)
         dart_manager = DartManager(config.dart_api_key, script_dir)
@@ -323,42 +353,62 @@ def main():
 
         tickers_from_db = db_manager.get_all_tickers()
         target_year = datetime.now().year - 1
+        commit_interval = 50  # 50개 종목마다 중간 저장
 
-        for ticker, name in tqdm(tickers_from_db, desc="재무 정보 수집 중"):
+        for i, (ticker, name) in enumerate(
+            tqdm(tickers_from_db, desc="재무 정보 수집 중")
+        ):
             latest_year_in_db = db_manager.get_latest_financial_year(ticker)
             if latest_year_in_db and latest_year_in_db >= target_year:
                 continue
 
-            # 1. 키움 API에서 PER, PBR 등 수집
-            fin_info = kiwoom_manager.get_financial_info(ticker)
-            if not fin_info:
-                fin_info = {}  # 기본 dict 생성
+            # 1. 키움 API 정보 수집
+            kiwoom_info = kiwoom_manager.get_financial_info(ticker)
 
-            # 2. DART API에서 ROE, 사업연도 수집
+            # 2. DART API 정보 수집
             dart_info = dart_manager.get_financial_info(ticker)
-            if dart_info:
-                fin_info.update(dart_info)  # 두 API의 결과를 합침
 
-            # 3. 데이터가 하나라도 있으면 DB에 저장
-            if "business_year" in fin_info:  # DART 정보가 있는 경우를 기준으로
+            # 3. EV/EBITDA 계산
+            ev_ebitda = calculate_ev_ebitda(kiwoom_info, dart_info)
+
+            # 4. ROE 계산
+            roe = None
+            if dart_info and "net_income" in dart_info and "total_equity" in dart_info:
+                if dart_info["total_equity"] > 0:
+                    roe = (dart_info["net_income"] / dart_info["total_equity"]) * 100
+
+            # 5. DB에 저장
+            if dart_info and "business_year" in dart_info:
                 db_data = {
                     "ticker": ticker,
-                    "business_year": fin_info.get("business_year"),
-                    "per": fin_info.get("per"),
-                    "pbr": fin_info.get("pbr"),
-                    "roe": fin_info.get("roe"),
-                    "ev_ebitda": None,
-                    "bps": fin_info.get("bps"),
+                    "business_year": dart_info.get("business_year"),
+                    "per": kiwoom_info.get("per") if kiwoom_info else None,
+                    "pbr": kiwoom_info.get("pbr") if kiwoom_info else None,
+                    "roe": roe,
+                    "ev_ebitda": ev_ebitda,
+                    "bps": kiwoom_info.get("bps") if kiwoom_info else None,
+                    "mac": kiwoom_info.get("mac") if kiwoom_info else None,
+                    "net_income": dart_info.get("net_income"),
+                    "total_equity": dart_info.get("total_equity"),
+                    "operating_income": dart_info.get("operating_income"),
+                    "depreciation": dart_info.get("depreciation"),
+                    "amortization": dart_info.get("amortization"),
+                    "total_debt": dart_info.get("total_debt"),
+                    "cash_and_equivalents": dart_info.get("cash_and_equivalents"),
                 }
                 db_manager.update_financial_info(db_data)
 
-        db_manager.commit()
-        logging.info("\n✅ 모든 데이터 수집 작업이 완료되었습니다.")
+            # 6. 주기적으로 DB에 커밋
+            if (i + 1) % commit_interval == 0:
+                db_manager.commit()
+                logging.info(f"💾 중간 저장 완료 ({i + 1}/{len(tickers_from_db)}).")
 
+        db_manager.commit()  # 마지막으로 남은 데이터 커밋
+        logging.info("\n✅ 모든 데이터 수집 작업이 완료되었습니다.")
     except Exception as e:
         logging.critical(f"💥 스크립트 실행 중 심각한 오류 발생: {e}", exc_info=True)
     finally:
-        if "db_manager" in locals():
+        if "db_manager" in locals() and db_manager:
             db_manager.close()
 
 

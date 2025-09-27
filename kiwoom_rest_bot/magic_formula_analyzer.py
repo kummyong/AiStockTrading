@@ -1,74 +1,65 @@
+# strategy.py
 import sqlite3
 import pandas as pd
 import os
 
 # --- 설정 ---
 DB_NAME = "stocks.db"
-# 상위 몇 개 종목을 출력할지 결정합니다.
-TOP_N = 30
 # -----------
 
 
-def analyze_magic_formula():
+def analyze_magic_formula(top_n=20):
     """
-    데이터베이스에서 재무 정보를 읽어와 마법 공식에 따라 종목 순위를 매깁니다.
+    데이터베이스에서 재무 정보를 읽어와 마법 공식에 따라 종목 순위를 매기고,
+    상위 종목 ticker 리스트를 반환합니다.
+
+    Args:
+        top_n (int): 선정할 상위 종목의 수.
+
+    Returns:
+        list: 마법 공식 상위 종목의 ticker 리스트. 분석 실패 시 빈 리스트를 반환합니다.
     """
-    # 1. 데이터베이스 연결 및 데이터 로드
     script_dir = os.path.dirname(os.path.abspath(__file__))
     db_path = os.path.join(script_dir, DB_NAME)
     if not os.path.exists(db_path):
-        print(
-            f"'{DB_NAME}'를 찾을 수 없습니다. 먼저 manage_data.py를 실행하여 데이터를 수집해주세요."
-        )
-        return
+        print(f"❌ 데이터베이스 파일('{db_path}')을 찾을 수 없습니다. manage_data.py를 먼저 실행해주세요.")
+        return []
 
-    conn = sqlite3.connect(db_path)
+    try:
+        conn = sqlite3.connect(db_path)
+        query = """
+        SELECT
+            s.ticker, s.name, f.roe, f.ev_ebitda
+        FROM
+            financial_info f
+        JOIN
+            stocks s ON s.ticker = f.ticker
+        """
+        df = pd.read_sql_query(query, conn)
+        conn.close()
 
-    # SQL 쿼리를 통해 stocks와 financial_info 테이블을 ticker 기준으로 합칩니다.
-    query = """
-    SELECT
-        s.ticker,
-        s.name,
-        f.roe,
-        f.ev_ebitda
-    FROM
-        financial_info f
-    JOIN
-        stocks s ON s.ticker = f.ticker
-    """
-    df = pd.read_sql_query(query, conn)
-    conn.close()
+        # 1. 분석에 부적합한 데이터 필터링 (ROE > 0, EV/EBITDA > 0)
+        df_filtered = df.dropna(subset=["roe", "ev_ebitda"])
+        df_filtered = df_filtered[(df_filtered["roe"] > 0) & (df_filtered["ev_ebitda"] > 0)]
 
-    print(f"총 {len(df)}개 종목의 재무 정보를 불러왔습니다.")
+        if len(df_filtered) < top_n:
+            print(f"⚠️ 분석 가능한 유효 데이터({len(df_filtered)}개)가 목표 종목 수({top_n}개)보다 적습니다.")
+            return []
 
-    # 2. 분석에 부적합한 데이터 필터링
-    #    - ROE나 EV/EBITDA 값이 없거나, 0 이하인 경우는 분석에서 제외합니다.
-    #      (수익을 내지 못하거나, 비교 기준이 없는 기업은 제외)
-    df_filtered = df.dropna(subset=["roe", "ev_ebitda"])
-    df_filtered = df_filtered[(df_filtered["roe"] > 0) & (df_filtered["ev_ebitda"] > 0)]
+        # 2. 마법 공식 순위 계산
+        df_filtered["rank_roe"] = df_filtered["roe"].rank(ascending=False)
+        df_filtered["rank_ev_ebitda"] = df_filtered["ev_ebitda"].rank(ascending=True)
+        df_filtered["rank_total"] = df_filtered["rank_roe"] + df_filtered["rank_ev_ebitda"]
 
-    if len(df_filtered) < TOP_N:
-        print("분석 가능한 유효 데이터가 너무 적습니다. 데이터를 더 수집해주세요.")
-        return
+        # 3. 최종 순위를 기준으로 정렬하고 상위 N개 종목 선정
+        df_final = df_filtered.sort_values(by="rank_total")
+        top_stocks = df_final.head(top_n)
 
-    print(f"필터링 후 {len(df_filtered)}개 종목으로 분석을 시작합니다.")
+        print("\n--- ✨ 마법 공식 분석 결과 (투자 목표) ---")
+        print(top_stocks[['ticker', 'name', 'roe', 'ev_ebitda', 'rank_total']].to_string(index=False))
 
-    # 3. 마법 공식 순위 계산
-    #    - 자본 수익률 순위: ROE가 높을수록 순위가 높다 (내림차순)
-    #    - 이익 수익률 순위: EV/EBITDA가 낮을수록 순위가 높다 (오름차순)
-    df_filtered["rank_roe"] = df_filtered["roe"].rank(ascending=False)
-    df_filtered["rank_ev_ebitda"] = df_filtered["ev_ebitda"].rank(ascending=True)
+        return top_stocks["ticker"].tolist()
 
-    # 4. 두 순위를 합산하여 최종 순위 계산
-    df_filtered["rank_total"] = df_filtered["rank_roe"] + df_filtered["rank_ev_ebitda"]
-
-    # 5. 최종 순위를 기준으로 정렬
-    df_final = df_filtered.sort_values(by="rank_total")
-
-    # 6. 결과 출력
-    print("\n--- ✨ 마법 공식 분석 결과 (상위", TOP_N, "개) ---")
-    print(df_final.head(TOP_N).to_string(index=False))
-
-
-if __name__ == "__main__":
-    analyze_magic_formula()
+    except Exception as e:
+        print(f"❌ 마법 공식 분석 중 오류 발생: {e}")
+        return []
