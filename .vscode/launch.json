@@ -16,6 +16,13 @@
       "request": "launch",
       "program": "${workspaceFolder}/kiwoom_rest_bot/manage_data.py",
       "console": "integratedTerminal"
+    },
+    {
+      "name": "Python: magic_formula_analyzer.py",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/kiwoom_rest_bot/magic_formula_analyzer.py",
+      "console": "integratedTerminal"
     }
   ]
 }

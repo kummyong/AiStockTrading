@@ -8,7 +8,8 @@ from datetime import datetime, timedelta
 import time
 import sqlite3
 from contextlib import asynccontextmanager
-from manage_data import update_database_and_charts  # manage_data.py에서 함수 가져오기
+
+# from manage_data import update_database_and_charts  # manage_data.py에서 함수 가져오기
 
 # --- ⚙️ 1. 사용자 설정 ---
 IS_MOCK = True
@@ -308,11 +309,11 @@ async def lifespan(app: FastAPI):
     """서버 시작 시 데이터베이스를 최신화하고 스케줄러를 실행합니다."""
     print("--- 서버 시작 프로세스 ---")
     print("데이터베이스 최신화를 시작합니다...")
-    try:
-        update_database_and_charts()
-        print("✅ 데이터베이스 최신화 완료.")
-    except Exception as e:
-        print(f"💥 데이터베이스 최신화 중 오류 발생: {e}")
+    # try:
+    #     update_database_and_charts()
+    #     print("✅ 데이터베이스 최신화 완료.")
+    # except Exception as e:
+    #     print(f"💥 데이터베이스 최신화 중 오류 발생: {e}")
 
     print("\n초기 토큰 발급을 시도합니다...")
     try:

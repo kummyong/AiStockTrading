@@ -1,195 +1,366 @@
-# kiwoom_rest_bot/manage_data.py
 import requests
-import json
 import sqlite3
-import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime
 import time
 import os
+import zipfile
+import io
+import xml.etree.ElementTree as ET
+import configparser
+import logging
+from tqdm import tqdm
 
-# --- ⚙️ 사용자 설정 ---
-IS_MOCK = True
-APP_KEY = "IWxXc-OxrNyAt3jBCkERK4EV7xbW6DYYHXqK3n0x57A"
-APP_SECRET = "FBAOtvQj0MJBHOmx3s8UBIdH0XK399iHIudXbO2H2Vo"
-ACCOUNT_NO = "81118476"
-
-if IS_MOCK:
-    BASE_URL = "https://mockapi.kiwoom.com"
-else:
-    BASE_URL = "https://api.kiwoom.com"
-# --------------------
+# --- 1. 로깅 설정 ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler("data_manager.log", encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
+)
 
 
-def _request_api(path: str, headers: dict = None, body: dict = None):
-    """Kiwoom REST API 요청을 위한 범용 래퍼 함수"""
-    URL = f"{BASE_URL}{path}"
-    try:
-        res = requests.post(URL, headers=headers, json=body)
-        time.sleep(1)  # API 요청 후 1초 대기
-        res.raise_for_status()
-        return res.json()
-    except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
-        print(f"API 요청 실패: {URL} - {e}")
-        if 'res' in locals():
-            print(f"응답 내용: {res.text}")
+# --- 2. 설정 로드 클래스 (실서버 전용) ---
+class ConfigManager:
+    """config.ini 파일에서 실서버용 설정을 읽어 관리합니다."""
+
+    def __init__(self, config_file="config.ini"):
+        if not os.path.isabs(config_file):
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            config_file = os.path.join(script_dir, config_file)
+
+        config = configparser.ConfigParser()
+        if not os.path.exists(config_file):
+            raise FileNotFoundError(f"설정 파일({config_file})을 찾을 수 없습니다.")
+        config.read(config_file, encoding="utf-8")
+
+        # [KIWOOM_REAL] 섹션의 설정 값을 직접 로드
+        self.base_url = config.get("KIWOOM_REAL", "base_url").strip("'\"")
+        self.kiwoom_app_key = config.get("KIWOOM_REAL", "app_key").strip("'\"")
+        self.kiwoom_app_secret = config.get("KIWOOM_REAL", "app_secret").strip("'\"")
+        self.account_no = config.get("KIWOOM_REAL", "account_no").strip("'\"")
+        self.dart_api_key = config.get("DART", "api_key").strip("'\"")
+        logging.info("✅ 실서버용 설정을 성공적으로 불러왔습니다.")
+
+
+# --- 3. DART API 관리 클래스 (이전과 동일) ---
+class DartManager:
+    # (이전 답변의 DartManager 클래스 코드와 동일)
+    """DART API 관련 기능을 관리합니다."""
+
+    def __init__(self, api_key, script_dir):
+        self.api_key = api_key
+        self.script_dir = script_dir
+        self.corp_codes = self._load_corp_codes()
+
+    def _load_corp_codes(self):
+        """DART 고유번호 XML 파일을 로드하거나 다운로드합니다."""
+        file_path = os.path.join(self.script_dir, "CORPCODE.xml")
+        if not os.path.exists(file_path):
+            logging.info(
+                "'CORPCODE.xml' 파일이 없어 DART API를 통해 자동으로 다운로드합니다..."
+            )
+            try:
+                url = "https://opendart.fss.or.kr/api/corpCode.xml"
+                params = {"crtfc_key": self.api_key}
+                res = requests.get(url, params=params)
+                res.raise_for_status()
+
+                # 응답이 zip 파일인지 확인
+                content_type = res.headers.get("Content-Type", "")
+                is_zip = (
+                    "application/zip" in content_type
+                    or "application/x-msdownload" in content_type
+                )
+                if not is_zip:
+                    logging.error(
+                        f"❌ DART API에서 zip 파일을 반환하지 않았습니다. API 키가 유효한지 확인해주세요."
+                    )
+                    logging.error(
+                        f"응답 내용: {res.text[:200]}"
+                    )  # 응답 내용 일부를 로깅
+                    return {}
+
+                with zipfile.ZipFile(io.BytesIO(res.content)) as zfile:
+                    zfile.extractall(self.script_dir)
+                logging.info("✅ 'CORPCODE.xml' 파일 다운로드 및 압축 해제 성공!")
+            except Exception as e:
+                logging.error(f"❌ 'CORPCODE.xml' 파일 다운로드 실패: {e}")
+                return {}
+
+        logging.info("DART 고유번호 파일(CORPCODE.xml)을 로드합니다...")
+        try:
+            with open(file_path, "rb") as f:
+                root = ET.parse(f).getroot()
+            corp_codes = {
+                item.find("stock_code")
+                .text.strip(): item.find("corp_code")
+                .text.strip()
+                for item in root.findall(".//list")
+                if item.find("stock_code").text.strip()
+            }
+            logging.info(
+                f"✅ 총 {len(corp_codes)}개의 상장사 DART 코드를 로드했습니다."
+            )
+            return corp_codes
+        except Exception as e:
+            logging.error(f"❌ DART 고유번호 파일 로드 중 오류 발생: {e}")
+            return {}
+
+    def get_dart_code(self, ticker: str):
+        return self.corp_codes.get(ticker)
+
+    def get_financial_info(self, ticker: str):
+        """DART API를 통해 최신 재무 정보를 가져옵니다."""
+        dart_code = self.get_dart_code(ticker)
+        if not dart_code:
+            logging.debug(
+                f"재무(DART): [{ticker}] DART 고유번호 없음 (ETF 등으로 추정)"
+            )
+            return None
+
+        current_year = datetime.now().year
+        for year in [current_year - 1, current_year - 2]:
+            try:
+                url = "https://opendart.fss.or.kr/api/fnlttSinglAcntAll.json"
+                params = {
+                    "crtfc_key": self.api_key,
+                    "corp_code": dart_code,
+                    "bsns_year": year,
+                    "reprt_code": "11011",
+                    "fs_div": "CFS",
+                }
+                res = requests.get(url, params=params, timeout=5)
+                res.raise_for_status()
+                data = res.json()
+
+                if data.get("status") != "000":
+                    params["fs_div"] = "OFS"
+                    res = requests.get(url, params=params, timeout=5)
+                    data = res.json()
+                    if data.get("status") != "000":
+                        continue
+
+                net_income, total_equity = None, None
+                for item in data.get("list", []):
+                    account_name = item.get("account_nm", "")
+                    if "당기순이익" in account_name:
+                        amount_str = item.get("thstrm_amount", "0").replace(",", "")
+                        net_income = int(amount_str) if amount_str else 0
+                    if account_name == "자본총계":
+                        amount_str = item.get("thstrm_amount", "0").replace(",", "")
+                        total_equity = int(amount_str) if amount_str else 0
+
+                if net_income is not None and total_equity not in [None, 0]:
+                    roe = (net_income / total_equity) * 100
+                    return {"roe": roe, "business_year": year}
+
+            except Exception as e:
+                logging.warning(
+                    f"재무(DART): [{ticker}] {year}년 정보 조회 중 오류: {e}"
+                )
+                continue
         return None
 
-def get_access_token():
-    """API 접근 토큰 발급"""
-    body = {
-        "grant_type": "client_credentials",
-        "appkey": APP_KEY,
-        "secretkey": APP_SECRET,
-    }
-    PATH = "/oauth2/token"
-    response_json = _request_api(path=PATH, body=body)
-    return response_json.get("token") if response_json else None
+
+# --- 4. 키움 API 관리 클래스 (이전과 동일) ---
+class KiwoomApiManager:
+    # (이전 답변의 KiwoomApiManager 클래스 코드와 동일)
+    """키움증권 API 요청을 관리합니다."""
+
+    def __init__(self, config):
+        self.config = config
+        self.access_token = self._get_access_token()
+
+    def _get_access_token(self):
+        res_json = self._request_api(
+            path="/oauth2/token",
+            headers={"Content-Type": "application/json;charset=UTF-8"},
+            body={
+                "grant_type": "client_credentials",
+                "appkey": self.config.kiwoom_app_key,
+                "secretkey": self.config.kiwoom_app_secret,
+            },
+        )
+        if res_json and "token" in res_json:
+            logging.info("✅ 토큰 발급 성공")
+            return res_json["token"]
+        logging.error(f"❌ 토큰 발급 실패: {res_json}")
+        return None
+
+    def get_kospi_tickers(self):
+        if not self.access_token:
+            return []
+        headers = {
+            "authorization": f"Bearer {self.access_token}",
+            "appkey": self.config.kiwoom_app_key,
+            "appsecret": self.config.kiwoom_app_secret,
+            "api-id": "ka10099",
+        }
+        body = {"mrkt_tp": "0"}
+        res_json = self._request_api(
+            path="/api/dostk/stkinfo", headers=headers, body=body
+        )
+        return res_json.get("list", []) if res_json else []
+
+    def get_financial_info(self, ticker: str):
+        """키움증권 API를 통해 PER, PBR 등의 재무 정보를 가져옵니다."""
+        if not self.access_token:
+            return None
+        headers = {
+            "authorization": f"Bearer {self.access_token}",
+            "appkey": self.config.kiwoom_app_key,
+            "appsecret": self.config.kiwoom_app_secret,
+            "api-id": "ka10001",
+        }
+        body = {"stk_cd": ticker}
+        res_json = self._request_api(
+            path="/api/dostk/stkinfo", headers=headers, body=body
+        )
+
+        if res_json and res_json.get("per"):
+            try:
+                return {
+                    "per": float(res_json.get("per", 0)),
+                    "pbr": float(res_json.get("pbr", 0)),
+                    "bps": int(res_json.get("bps", 0)),
+                }
+            except (ValueError, TypeError):
+                logging.warning(f"재무(키움): [{ticker}] 데이터 변환 중 오류 발생")
+                return None
+        return None
+
+    def _request_api(self, path, headers=None, body=None, params=None):
+        url = f"{self.config.base_url}{path}"
+        try:
+            if body:  # POST 요청
+                res = requests.post(url, headers=headers, json=body, timeout=10)
+            else:  # GET 요청
+                res = requests.get(url, headers=headers, params=params, timeout=10)
+            time.sleep(1)
+            res.raise_for_status()
+            return res.json()
+        except requests.exceptions.RequestException as e:
+            logging.error(f"API 요청 실패: {url} - {e}")
+            return None
 
 
-def get_kospi_tickers(token):
-    """모의투자 KOSPI 전체 종목 코드를 받아오는 함수"""
-    headers = {
-        "Content-Type": "application/json;charset=UTF-8",
-        "authorization": f"Bearer {token}",
-        "api-id": "ka10099",
-    }
-    body = {"mrkt_tp": "0"}  # 0: 코스피
-    PATH = "/api/dostk/stkinfo"
-    print("KOSPI 전체 종목 코드 요청 중...")
-    response_json = _request_api(path=PATH, headers=headers, body=body)
-    
-    if response_json and response_json.get("return_code") == 0:
-        return response_json.get("list", [])
-    else:
-        print(f"종목 코드 요청 실패: {response_json}")
-        return []
+# --- 5. 데이터베이스 관리 클래스 (이전과 동일) ---
+class DatabaseManager:
+    # (이전 답변의 DatabaseManager 클래스 코드와 동일)
+    """SQLite 데이터베이스 작업을 관리합니다."""
 
+    def __init__(self, db_path):
+        self.conn = sqlite3.connect(db_path)
+        self.cursor = self.conn.cursor()
+        self._create_tables()
 
-def get_daily_chart_api(token, ticker: str):
-    """API를 호출하여 주식 일봉 데이터를 받아오는 함수"""
-    headers = {
-        "Content-Type": "application/json;charset=UTF-8",
-        "authorization": f"Bearer {token}",
-        "api-id": "ka10081",
-    }
-    PATH = "/api/dostk/chart"
-    base_date = datetime.now().strftime("%Y%m%d")
-    body = {"stk_cd": ticker, "base_dt": base_date, "upd_stkpc_tp": "1"}
-
-    response_json = _request_api(path=PATH, headers=headers, body=body)
-
-    if response_json and response_json.get("return_code") == 0:
-        return response_json.get("stk_dt_pole_chart_qry", [])
-    else:
-        print(f"[{ticker}] 일봉 데이터 수신 실패: {response_json}")
-        return []
-
-
-def update_database_and_charts():
-    """DB에 KOSPI 종목 정보를 업데이트하고, 모든 종목의 최신 일봉 데이터를 저장/업데이트합니다."""
-
-    # 1. 토큰 발급
-    print("API 접근 토큰 발급 시도...")
-    access_token = get_access_token()
-    if not access_token:
-        print("토큰 발급에 실패하여 프로그램을 종료합니다.")
-        return
-    print("토큰 발급 성공.")
-
-    # 2. DB 연결
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    db_path = os.path.join(script_dir, "stocks.db")
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-
-    # 3. 종목 목록 업데이트
-    print("\n--- KOSPI 종목 목록 업데이트 시작 ---")
-    tickers_from_api = get_kospi_tickers(access_token)
-    if tickers_from_api:
-        cursor.execute(
+    def _create_tables(self):
+        self.cursor.execute(
             "CREATE TABLE IF NOT EXISTS stocks (ticker TEXT PRIMARY KEY, name TEXT)"
         )
-        insert_data = [(t["code"], t["name"].strip()) for t in tickers_from_api]
-        cursor.executemany(
-            "INSERT OR IGNORE INTO stocks (ticker, name) VALUES (?, ?)", insert_data
+        self.cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS financial_info (
+                ticker TEXT PRIMARY KEY, business_year INTEGER,
+                per REAL, pbr REAL, roe REAL, ev_ebitda REAL, bps INTEGER
+            )"""
         )
-        conn.commit()
-        print(
-            f"✅ API로부터 {len(insert_data)}개 종목 정보를 가져와 DB를 업데이트했습니다."
+        self.conn.commit()
+
+    def get_all_tickers(self):
+        return self.cursor.execute("SELECT ticker, name FROM stocks").fetchall()
+
+    def get_latest_financial_year(self, ticker: str):
+        self.cursor.execute(
+            "SELECT business_year FROM financial_info WHERE ticker=?", (ticker,)
         )
-    else:
-        print(
-            "API로부터 종목 정보를 가져오는 데 실패했습니다. 기존 DB 정보로 차트 업데이트를 시도합니다."
+        result = self.cursor.fetchone()
+        return result[0] if result else None
+
+    def update_tickers(self, tickers):
+        self.cursor.executemany(
+            "INSERT OR IGNORE INTO stocks (ticker, name) VALUES (?, ?)", tickers
+        )
+        self.conn.commit()
+        logging.info(f"{len(tickers)}개 종목 정보를 DB에 업데이트했습니다.")
+
+    def update_financial_info(self, data):
+        self.cursor.execute(
+            """INSERT OR REPLACE INTO financial_info (ticker, business_year, per, pbr, roe, ev_ebitda, bps)
+               VALUES (:ticker, :business_year, :per, :pbr, :roe, :ev_ebitda, :bps)""",
+            data,
         )
 
-    # 4. 일봉 차트 데이터 업데이트
-    print("\n--- 일봉 차트 데이터 업데이트 시작 ---")
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS daily_charts (
-            ticker TEXT, date TEXT, open INTEGER, high INTEGER, low INTEGER, close INTEGER, volume INTEGER,
-            PRIMARY KEY (ticker, date)
-        )
-        """
-    )
+    def commit(self):
+        self.conn.commit()
 
-    tickers_from_db = cursor.execute("SELECT ticker, name FROM stocks").fetchall()
-    # ticker_list is now a list of tuples (ticker, name)
+    def close(self):
+        self.conn.close()
 
-    print(f"총 {len(tickers_from_db)}개 종목의 일봉 데이터 업데이트를 시작합니다...")
 
-    for i, (ticker, name) in enumerate(tickers_from_db):
-        print(f"[{i+1}/{len(tickers_from_db)}] {ticker} ({name}) 데이터 수집 중...")
+# --- 6. 메인 실행 로직 ---
+def main():
+    """메인 실행 함수"""
+    try:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        config = ConfigManager()
 
-        # DB에서 해당 종목의 마지막 데이터 날짜를 조회합니다.
-        cursor.execute("SELECT MAX(date) FROM daily_charts WHERE ticker=?", (ticker,))
-        last_date_in_db = cursor.fetchone()[0]
+        db_path = os.path.join(script_dir, "stocks.db")
+        db_manager = DatabaseManager(db_path)
+        dart_manager = DartManager(config.dart_api_key, script_dir)
+        kiwoom_manager = KiwoomApiManager(config)
 
-        # 데이터가 오늘 날짜와 동일하다면 최신 상태로 간주하고 API 호출을 건너뜁니다.
-        today_str = datetime.now().strftime("%Y%m%d")
-        if last_date_in_db == today_str:
-            print("  -> 최신 데이터가 이미 존재합니다. 업데이트를 건너뜁니다.")
-            continue
+        if not kiwoom_manager.access_token:
+            return
 
-        chart_data = get_daily_chart_api(access_token, ticker)
+        logging.info("KOSPI 종목 목록을 실서버 API로부터 가져옵니다...")
+        tickers_from_api = kiwoom_manager.get_kospi_tickers()
+        if tickers_from_api:
+            ticker_data = [(t["code"], t["name"].strip()) for t in tickers_from_api]
+            db_manager.update_tickers(ticker_data)
 
-        if chart_data:
-            new_data = []
-            if last_date_in_db:
-                # 마지막 날짜 이후의 데이터만 필터링합니다.
-                new_data = [row for row in chart_data if row["dt"] > last_date_in_db]
-            else:
-                # DB에 데이터가 없는 경우, 모든 데이터를 새 데이터로 간주합니다.
-                new_data = chart_data
+        tickers_from_db = db_manager.get_all_tickers()
+        target_year = datetime.now().year - 1
 
-            if new_data:
-                insert_chart_data = [
-                    (
-                        ticker,
-                        row["dt"],
-                        int(row["open_pric"]),
-                        int(row["high_pric"]),
-                        int(row["low_pric"]),
-                        int(row["cur_prc"]),
-                        int(row["trde_qty"]),
-                    )
-                    for row in new_data
-                ]
-                # 새 데이터만 INSERT 합니다. (중복 방지를 위해 IGNORE 사용)
-                cursor.executemany(
-                    "INSERT OR IGNORE INTO daily_charts (ticker, date, open, high, low, close, volume) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    insert_chart_data,
-                )
-                conn.commit()
-                print(f"  -> {len(insert_chart_data)}개의 신규 데이터 추가됨.")
-            else:
-                print("  -> 추가할 신규 데이터 없음.")
+        for ticker, name in tqdm(tickers_from_db, desc="재무 정보 수집 중"):
+            latest_year_in_db = db_manager.get_latest_financial_year(ticker)
+            if latest_year_in_db and latest_year_in_db >= target_year:
+                continue
 
-        # time.sleep(1) # API 호출 제한은 _request_api 함수로 이동
+            # 1. 키움 API에서 PER, PBR 등 수집
+            fin_info = kiwoom_manager.get_financial_info(ticker)
+            if not fin_info:
+                fin_info = {}  # 기본 dict 생성
 
-    print("\n✅ 모든 작업이 완료되었습니다.")
-    conn.close()
+            # 2. DART API에서 ROE, 사업연도 수집
+            dart_info = dart_manager.get_financial_info(ticker)
+            if dart_info:
+                fin_info.update(dart_info)  # 두 API의 결과를 합침
+
+            # 3. 데이터가 하나라도 있으면 DB에 저장
+            if "business_year" in fin_info:  # DART 정보가 있는 경우를 기준으로
+                db_data = {
+                    "ticker": ticker,
+                    "business_year": fin_info.get("business_year"),
+                    "per": fin_info.get("per"),
+                    "pbr": fin_info.get("pbr"),
+                    "roe": fin_info.get("roe"),
+                    "ev_ebitda": None,
+                    "bps": fin_info.get("bps"),
+                }
+                db_manager.update_financial_info(db_data)
+
+        db_manager.commit()
+        logging.info("\n✅ 모든 데이터 수집 작업이 완료되었습니다.")
+
+    except Exception as e:
+        logging.critical(f"💥 스크립트 실행 중 심각한 오류 발생: {e}", exc_info=True)
+    finally:
+        if "db_manager" in locals():
+            db_manager.close()
 
 
 if __name__ == "__main__":
-    update_database_and_charts()
+    main()
