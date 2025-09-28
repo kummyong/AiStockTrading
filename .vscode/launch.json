@@ -15,14 +15,20 @@
       "type": "python",
       "request": "launch",
       "program": "${workspaceFolder}/kiwoom_rest_bot/manage_data.py",
-      "console": "integratedTerminal"
+      "console": "integratedTerminal",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}"
+      }
     },
     {
       "name": "Python: magic_formula_analyzer.py",
       "type": "python",
       "request": "launch",
       "program": "${workspaceFolder}/kiwoom_rest_bot/magic_formula_analyzer.py",
-      "console": "integratedTerminal"
+      "console": "integratedTerminal",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}"
+      }
     },
     {
       "name": "Python: Streamlit (backtest_app.py)",
@@ -33,7 +39,10 @@
         "run",
         "${workspaceFolder}/kiwoom_rest_bot/backtest_app.py"
       ],
-      "console": "integratedTerminal"
+      "console": "integratedTerminal",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}"
+      }
     }
   ]
 }

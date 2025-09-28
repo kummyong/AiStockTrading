@@ -7,3 +7,4 @@ stocks.db
 *.xml
 *.pdf
 config.ini
+.coverage
